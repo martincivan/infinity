@@ -37,6 +37,7 @@ import math
 import os
 import re
 import string
+import unicodedata
 
 import datrie
 from hanziconv import HanziConv
@@ -64,6 +65,19 @@ _SNOWBALL_LANGUAGE_MAP = {
     "swedish": "swedish",
     "turkish": "turkish",
 }
+
+# Languages tokenized with diacritics folded to ASCII and no stemming.
+# SPLIT_CHAR only keeps ASCII letter runs whole, so accented words would
+# otherwise be fragmented before indexing ('škola' -> 'š kola'), and
+# neither language has a Snowball stemmer.
+_DIACRITIC_FOLDING_LANGUAGES = {"slovak", "czech"}
+
+
+def fold_diacritics(text: str) -> str:
+    """Strip combining marks from Latin text: 'škola' -> 'skola'."""
+    if text.isascii():
+        return text
+    return "".join(c for c in unicodedata.normalize("NFD", text) if not unicodedata.combining(c))
 
 
 class RagTokenizer:
@@ -122,6 +136,7 @@ class RagTokenizer:
         self.stemmer = SnowballStemmer("english")
         self.lemmatizer = WordNetLemmatizer()
         self._use_lemmatizer = True  # WordNet only supports English
+        self._fold_diacritics = False
 
         self.SPLIT_CHAR = r"([ ,\.<>/?;:'\[\]\\`!@#$%^&*\(\)\{\}\|_+=《》，。？、；‘’：“”【】~！￥%……（）——-]+|[a-zA-Z0-9,\.-]+)"
 
@@ -163,6 +178,14 @@ class RagTokenizer:
                       Case-insensitive.
         """
         lang_key = language.strip().lower()
+
+        self._fold_diacritics = lang_key in _DIACRITIC_FOLDING_LANGUAGES
+        if self._fold_diacritics:
+            # Folded to ASCII in tokenize() and left unstemmed: there is no
+            # Snowball stemmer for these languages (see _normalize_token).
+            logging.debug("Tokenizer language set to '%s' (diacritics folding, no stemming)", language)
+            return
+
         snowball_lang = _SNOWBALL_LANGUAGE_MAP.get(lang_key)
 
         if snowball_lang is not None:
@@ -389,8 +412,11 @@ class RagTokenizer:
 
         When the lemmatizer is enabled (English), applies lemmatization
         before stemming.  For other Snowball-supported languages, only
-        stemming is applied.  Non-alphabetic tokens are returned as-is.
+        stemming is applied.  Non-alphabetic tokens are returned as-is,
+        and so is every token of a diacritic-folding language.
         """
+        if self._fold_diacritics:
+            return t
         if re.match(r"[a-zA-Z_-]+$", t):
             if self._use_lemmatizer:
                 return self.stemmer.stem(self.lemmatizer.lemmatize(t))
@@ -421,6 +447,8 @@ class RagTokenizer:
         return txt_lang_pairs
 
     def tokenize(self, line: str) -> str:
+        if self._fold_diacritics:
+            line = fold_diacritics(line)
         line = re.sub(r"\W+", " ", line)
         line = self._strQ2B(line).lower()
         line = self._tradi2simp(line)
