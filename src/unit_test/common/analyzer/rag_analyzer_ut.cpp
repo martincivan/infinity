@@ -22,6 +22,7 @@ import :ut.base_test;
 import :term;
 import :analyzer;
 import :rag_analyzer;
+import :stemmer;
 import :darts_trie;
 import :darts;
 import :status;
@@ -343,8 +344,8 @@ TEST_F(RAGAnalyzerTest, test_set_language_slovak) {
     if (!analyzer_) {
         FAIL() << "RAGAnalyzer not loaded, skipping test";
     }
-    // Slovak has no Snowball stemmer; diacritics are folded to ASCII instead.
-    // Compare C++ result with Python result.
+    // Slovak is stemmed with the light stemmer in slovak_stemmer.h and only
+    // then folded to ASCII. Compare C++ result with Python result.
     std::string python_cmd = "uv run " + rag_tokenizer_path_ + "/rag_tokenizer.py " + "-l slovak \"škola daňové priznanie\"";
     std::cout << "Call Python tokenizer: " << python_cmd << std::endl;
 
@@ -365,8 +366,7 @@ TEST_F(RAGAnalyzerTest, test_set_language_slovak) {
     std::string cxx_result = analyzer_->Tokenize("škola daňové priznanie");
     std::cout << "C++ 'škola daňové priznanie' tokenized (Slovak): " << cxx_result << std::endl;
 
-    EXPECT_TRUE(cxx_result.find("skola") != std::string::npos);
-    EXPECT_TRUE(cxx_result.find("danove") != std::string::npos);
+    EXPECT_EQ(cxx_result, "skol dan priznani");
     EXPECT_EQ(cxx_result, python_result);
 }
 
@@ -394,24 +394,170 @@ TEST_F(RAGAnalyzerTest, test_set_language_czech) {
     std::string cxx_result = analyzer_->Tokenize("příliš žluťoučký kůň");
     std::cout << "C++ 'příliš žluťoučký kůň' tokenized (Czech): " << cxx_result << std::endl;
 
-    EXPECT_TRUE(cxx_result.find("prilis") != std::string::npos);
-    EXPECT_TRUE(cxx_result.find("zlutoucky") != std::string::npos);
-    EXPECT_TRUE(cxx_result.find("kun") != std::string::npos);
+    EXPECT_EQ(cxx_result, "prilis zlutouck kun");
     EXPECT_EQ(cxx_result, python_result);
 }
 
-TEST_F(RAGAnalyzerTest, test_slovak_no_stemming) {
+TEST_F(RAGAnalyzerTest, test_slovak_light_stemming) {
     if (!analyzer_) {
         FAIL() << "RAGAnalyzer not loaded, skipping test";
     }
-    // Slovak disables stemming and lemmatization: "running" must pass
-    // through unstemmed and "skoly" must keep its inflected form.
+    // The point of stemming on top of folding: four case forms of "škola"
+    // collapse to one term, which folding alone cannot do because it leaves
+    // the inflectional suffix in place.
     analyzer_->SetLanguage("slovak");
-    EXPECT_EQ(analyzer_->Tokenize("skoly running"), "skoly running");
+    EXPECT_EQ(analyzer_->Tokenize("školy škôl školám školách"), "skol skol skol skol");
+    // The superlative prefix "naj-" is stripped as well.
+    EXPECT_EQ(analyzer_->Tokenize("najväčší najlepšie"), "vacs lepsi");
 
-    // Switching back to a Snowball language re-enables stemming.
+    // Switching back to a Snowball language restores English lemmatization.
     analyzer_->SetLanguage("english");
     EXPECT_EQ(analyzer_->Tokenize("running"), "run");
+}
+
+TEST_F(RAGAnalyzerTest, test_switching_from_a_stem_and_fold_language) {
+    if (!analyzer_) {
+        FAIL() << "RAGAnalyzer not loaded, skipping test";
+    }
+    analyzer_->SetLanguage("slovak");
+    EXPECT_EQ(analyzer_->Tokenize("školy running"), "skol running");
+
+    // Chinese has no entry in SNOWBALL_LANGUAGE_MAP, so SetLanguage keeps the
+    // previous Snowball stemmer by design. That stemmer must still be the
+    // English one: Slovak and Czech never touch stemmer_, they have their own
+    // instance. Accented words also go back to the legacy fragmentation.
+    analyzer_->SetLanguage("chinese");
+    EXPECT_EQ(analyzer_->Tokenize("running skoly"), "run skoli");
+    EXPECT_EQ(analyzer_->Tokenize("škola"), "š kola");
+}
+
+TEST_F(RAGAnalyzerTest, test_czech_light_stemming) {
+    if (!analyzer_) {
+        FAIL() << "RAGAnalyzer not loaded, skipping test";
+    }
+    // Czech uses Snowball's own algorithm (added in Snowball 3.1.0).
+    analyzer_->SetLanguage("czech");
+    EXPECT_EQ(analyzer_->Tokenize("školy škol školám ve školách"), "skol skol skol ve skol");
+}
+
+// Word/stem pairs produced by the reference implementations, one per rule
+// branch, so a change to slovak_stemmer.h or to the generated Czech file
+// shows up here rather than only as a retrieval regression.
+//
+// Slovak: the Wikimedia search-extra SlovakStemmer this file was ported from.
+// Czech: the Snowball project's own czech vocabulary (algorithms/czech.sbl),
+// against which the whole 58k-word list was checked when the generated
+// stem_UTF_8_czech.cpp was added.
+TEST_F(RAGAnalyzerTest, test_slovak_stemmer_matches_reference) {
+    const std::vector<std::pair<std::string, std::string>> cases{
+        {"šatoch", "šat"},       // -atoch
+        {"dievčaťom", "dievč"},  // -aťom
+        {"rokoch", "rok"},       // -och
+        {"mojich", "moj"},       // -ich
+        {"ďalších", "ďalš"},     // -ích
+        {"jedného", "jedn"},     // -ého
+        {"rukami", "ruk"},       // -ami
+        {"každému", "každ"},     // -ému
+        {"chcete", "chk"},       // -ete, palatalised
+        {"svieti", "svi"},       // -eti
+        {"bianchiho", "bianch"}, // -iho
+        {"ďalšími", "ďalš"},     // -ími
+        {"režimu", "reh"},       // -imu, palatalised
+        {"dieťaťa", "dieť"},     // -aťa
+        {"rukách", "ruk"},       // -ách
+        {"strata", "str"},       // -ata
+        {"prekliaty", "prekli"}, // -aty
+        {"všetkých", "všetk"},   // -ých
+        {"hotové", "hot"},       // -ové
+        {"otcovi", "otc"},       // -ovi
+        {"všetkými", "všetk"},   // -ými
+        {"celkom", "celk"},      // -om
+        {"charles", "char"},     // -es
+        {"problém", "prob"},     // -ém
+        {"myslím", "mys"},       // -ím
+        {"dievčat", "dievč"},    // -at
+        {"poznám", "pozn"},      // -ám
+        {"carlos", "carl"},      // -os
+        {"autobus", "autob"},    // -us
+        {"predtým", "predt"},    // -ým
+        {"svojimi", "svoji"},    // -mi
+        {"náhodou", "náhod"},    // -ou
+        {"radšej", "radš"},      // -ej
+        {"dolárov", "dolár"},    // possessive -ov
+        {"franklin", "frankl"},  // possessive -in
+        {"najlepšie", "lepši"},  // superlative naj-
+        {"všetci", "všetk"},     // [cč][ie] -> k
+        {"zaslúži", "zaslúh"},   // [zž][ie] -> h
+        {"slovníkoch", "slovník"}, {"školy", "škol"},
+    };
+    Stemmer stemmer;
+    ASSERT_TRUE(stemmer.Init(STEM_LANG_SLOVAK));
+    std::string stem;
+    for (const auto &[word, expected] : cases) {
+        ASSERT_TRUE(stemmer.Stem(word, stem)) << word;
+        EXPECT_EQ(stem, expected) << word;
+    }
+    // Words with no matching rule, and words too short for one, are returned
+    // unchanged.
+    for (const auto &word : {"running", "dom", ""}) {
+        ASSERT_TRUE(stemmer.Stem(word, stem)) << word;
+        EXPECT_EQ(stem, word) << word;
+    }
+}
+
+TEST_F(RAGAnalyzerTest, test_czech_stemmer_matches_snowball) {
+    Stemmer stemmer;
+    ASSERT_TRUE(stemmer.Init(STEM_LANG_CZECH));
+    const std::vector<std::pair<std::string, std::string>> cases{
+        {"albech", "alb"},
+        {"absolutních", "absolutn"},
+        {"abchazského", "abchazsk"},
+        {"básněmi", "básn"},
+        {"americkému", "americk"},
+        {"atleti", "atlet"},
+        {"absolutního", "absolutn"},
+        {"aktivními", "aktivn"},
+        {"adresách", "adres"},
+        {"cordata", "cord"},
+        {"automaty", "autom"},
+        {"aerodynamických", "aerodynamick"},
+        {"dynama", "dyn"},
+        {"agenturami", "agentur"},
+        {"akciové", "akci"},
+        {"architektovi", "architekt"},
+        {"africkými", "africk"},
+        {"absolventem", "absolvent"},
+        {"aerodynamickém", "aerodynamick"},
+        {"abecedním", "abecedn"},
+        {"absolventům", "absolvent"},
+        {"abdikovat", "abdik"},
+        {"aktivitám", "aktivit"},
+        {"školy", "škol"},
+        {"školách", "škol"},
+    };
+    for (const auto &[word, expected] : cases) {
+        std::string stem;
+        ASSERT_TRUE(stemmer.Stem(word, stem)) << word;
+        EXPECT_EQ(stem, expected) << word;
+    }
+}
+
+TEST_F(RAGAnalyzerTest, test_latin_lowercase_table) {
+    // Uppercase accented letters lowercase to their accented counterparts,
+    // which is what leaves the stemmers a lowercase accented token to work on.
+    EXPECT_EQ(RAGAnalyzer::LowerLatin("ÁÄČĎÉÍĹĽŇÓÔŔŠŤÚÝŽ"), "áäčďéíĺľňóôŕšťúýž");
+    EXPECT_EQ(RAGAnalyzer::LowerLatin("ĚŘŮÝ"), "ěřůý");
+    // Only the accented block is touched; ASCII is left to the per-token
+    // ASCII lowercase that runs later.
+    EXPECT_EQ(RAGAnalyzer::LowerLatin("Škola Daňové"), "škola Daňové");
+    // Already-lowercase letters and letters without an uppercase pair.
+    EXPECT_EQ(RAGAnalyzer::LowerLatin("škola æœßøłđ"), "škola æœßøłđ");
+    // U+0130 İ is the one letter whose str.lower() is two characters in
+    // Python; both sides map it to a plain "i" so the mapping stays 1:1.
+    EXPECT_EQ(RAGAnalyzer::LowerLatin("İ"), "i");
+    // The table is deliberately limited to U+00C0-U+017F, like the fold table.
+    EXPECT_EQ(RAGAnalyzer::LowerLatin("ȘȚ Ḍ 한국어"), "ȘȚ Ḍ 한국어");
+    EXPECT_EQ(RAGAnalyzer::LowerLatin("Hello World 123"), "Hello World 123");
 }
 
 TEST_F(RAGAnalyzerTest, test_diacritics_folding_table) {
@@ -467,7 +613,7 @@ TEST_F(RAGAnalyzerTest, test_out_of_range_diacritics_parity_with_python) {
     std::cout << "C++ tokenized (Slovak): " << cxx_result << std::endl;
 
     // In-range diacritics fold, out-of-range ones are carried through as-is.
-    EXPECT_TRUE(cxx_result.find("skola") != std::string::npos);
+    EXPECT_TRUE(cxx_result.find("skol") != std::string::npos);
     EXPECT_TRUE(cxx_result.find("한국어") != std::string::npos);
     EXPECT_TRUE(cxx_result.find("ṣṭḥ") != std::string::npos);
     EXPECT_EQ(cxx_result, python_result);
@@ -477,13 +623,14 @@ TEST_F(RAGAnalyzerTest, test_slovak_tokenize_with_position) {
     if (!analyzer_) {
         FAIL() << "RAGAnalyzer not loaded, skipping test";
     }
-    // Folding shrinks 2-byte letters to 1 byte; positions must still refer
-    // to byte offsets in the original input ("š" and "ň"/"é" are 2 bytes).
+    // Stemming and folding both shorten the emitted term; positions must
+    // still refer to byte offsets in the original input ("š" and "ň"/"é" are
+    // 2 bytes each).
     analyzer_->SetLanguage("slovak");
     auto [tokens, positions] = analyzer_->TokenizeWithPosition("škola daňové");
     ASSERT_EQ(tokens.size(), 2u);
-    EXPECT_EQ(tokens[0], "skola");
-    EXPECT_EQ(tokens[1], "danove");
+    EXPECT_EQ(tokens[0], "skol");
+    EXPECT_EQ(tokens[1], "dan");
     ASSERT_EQ(positions.size(), 2u);
     EXPECT_EQ(positions[0].first, 0u);
     // "škola" spans bytes [0, 6) of the original input.
