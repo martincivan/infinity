@@ -24,6 +24,7 @@ import :darts_trie;
 import :stemmer;
 import :analyzer;
 import :wordnet_lemmatizer;
+import :slovak_lemmatizer;
 import :logger;
 
 import third_party;
@@ -165,6 +166,8 @@ public:
     std::unique_ptr<Stemmer> stemmer_;
 
     std::unique_ptr<Stemmer> latin_stemmer_; // Slovak/Czech; see SetLanguage()
+
+    const SlovakLemmatizer *slovak_lemmatizer_{nullptr}; // shared, not owned; see SetLanguage()
 
     OpenCC *opencc_{nullptr};
 

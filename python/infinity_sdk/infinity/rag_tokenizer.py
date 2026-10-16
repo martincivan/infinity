@@ -193,12 +193,45 @@ class _SlovakStemmer:
             return length - 3
         return length
 
-    def stemWord(self, word: str) -> str:  # noqa: N802 - mirrors the snowballstemmer API
+    def stemWord(self, word: str) -> str:  # mirrors the snowballstemmer API
         chars = list(word)
         length = self._remove_case(chars, len(chars))
         length = self._remove_possessives(chars, length)
         length = self._remove_prefixes(chars, length)
         return "".join(chars[:length])
+
+
+class _SlovakLemmatizer:
+    """Dictionary forms of inflected Slovak words.
+
+    Covers the forms the light stemmer cannot reduce on its own ("ľudí" ->
+    "ľudia", "psovi" -> "pes"). The table is resource/slovak/lemma.tsv: one
+    "form<TAB>lemma" line per lowercase form.
+    tools/generate_slovak_lemma_table.py derives it from the hunspell-sk
+    dictionary, and it carries that dictionary's licence (MPL-2.0) next to it.
+    Mirrors SlovakLemmatizer in the C++ RAGAnalyzer.
+    """
+
+    TABLE_PATH = "/usr/share/infinity/resource/slovak/lemma.tsv"
+    _shared = {}
+
+    @classmethod
+    def shared(cls, path: str = TABLE_PATH):
+        """The table at path, read once per process; None when it is missing."""
+        if path not in cls._shared:
+            if os.path.exists(path):
+                cls._shared[path] = cls(path)
+            else:
+                logging.warning("Slovak lemma table not found, stemming without it: %s", path)
+                cls._shared[path] = None
+        return cls._shared[path]
+
+    def __init__(self, path: str):
+        with open(path, encoding="utf-8") as table:
+            self._lemmas = dict(line.rstrip("\n").split("\t", 1) for line in table if "\t" in line)
+
+    def lemmatize(self, form: str) -> str:
+        return self._lemmas.get(form, form)
 
 
 def _fold_char(char: str) -> str:
@@ -287,6 +320,7 @@ class RagTokenizer:
         self._use_lemmatizer = True  # WordNet only supports English
         self._stem_and_fold = False
         self._latin_stemmer = None  # Slovak/Czech; see set_language()
+        self._slovak_lemmatizer = None  # see set_language()
 
         self.SPLIT_CHAR = self.SPLIT_CHAR_ASCII
 
@@ -340,6 +374,9 @@ class RagTokenizer:
             # -- which leaves the previous stemmer in place by design -- can
             # never land on a stemmer with a different API.
             self._latin_stemmer = _SlovakStemmer() if lang_key == "slovak" else snowballstemmer.stemmer(lang_key)
+            # Slovak first looks the token up in a lemma table, which reaches
+            # the forms the suffix rules miss ("ľudí" -> "ľudia").
+            self._slovak_lemmatizer = _SlovakLemmatizer.shared() if lang_key == "slovak" else None
             logging.debug("Tokenizer language set to '%s' (light stemming, then diacritics folding)", language)
             return
 
@@ -573,10 +610,13 @@ class RagTokenizer:
 
         A stem-and-fold language stems the accented token and folds the stem
         afterwards, so that 'škôl' and 'školy' meet at 'skol'; folding first
-        would strip the accents the suffix rules match on.
+        would strip the accents the suffix rules match on. Slovak first replaces
+        the token with its lemma when the lemma table has one.
         """
         if self._stem_and_fold:
             if _LATIN_WORD_PATTERN.match(t):
+                if self._slovak_lemmatizer:
+                    t = self._slovak_lemmatizer.lemmatize(t)
                 t = self._latin_stemmer.stemWord(t)
             return fold_diacritics(t)
         if re.match(r"[a-zA-Z_-]+$", t):

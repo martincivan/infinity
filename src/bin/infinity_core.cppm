@@ -422,6 +422,7 @@ export import :rank_features_analyzer;
 export import :whitespace_analyzer;
 export import :tokenizer;
 export import :wordnet_lemmatizer;
+export import :slovak_lemmatizer;
 export import :jieba;
 export import :zsv;
 export import :status;

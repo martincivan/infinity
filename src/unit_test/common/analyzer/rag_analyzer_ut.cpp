@@ -22,6 +22,7 @@ import :ut.base_test;
 import :term;
 import :analyzer;
 import :rag_analyzer;
+import :slovak_lemmatizer;
 import :stemmer;
 import :darts_trie;
 import :darts;
@@ -346,7 +347,7 @@ TEST_F(RAGAnalyzerTest, test_set_language_slovak) {
     }
     // Slovak is stemmed with the light stemmer in slovak_stemmer.h and only
     // then folded to ASCII. Compare C++ result with Python result.
-    std::string python_cmd = "uv run " + rag_tokenizer_path_ + "/rag_tokenizer.py " + "-l slovak \"škola daňové priznanie\"";
+    std::string python_cmd = "uv run " + rag_tokenizer_path_ + "/rag_tokenizer.py " + "-l slovak \"škola daň priznanie\"";
     std::cout << "Call Python tokenizer: " << python_cmd << std::endl;
 
     FILE *pipe = popen(python_cmd.c_str(), "r");
@@ -360,11 +361,11 @@ TEST_F(RAGAnalyzerTest, test_set_language_slovak) {
     }
     // Remove trailing newline
     python_result.erase(python_result.find_last_not_of(" \n\r\t") + 1);
-    std::cout << "Python 'škola daňové priznanie' tokenized (Slovak): " << python_result << std::endl;
+    std::cout << "Python 'škola daň priznanie' tokenized (Slovak): " << python_result << std::endl;
 
     analyzer_->SetLanguage("slovak");
-    std::string cxx_result = analyzer_->Tokenize("škola daňové priznanie");
-    std::cout << "C++ 'škola daňové priznanie' tokenized (Slovak): " << cxx_result << std::endl;
+    std::string cxx_result = analyzer_->Tokenize("škola daň priznanie");
+    std::cout << "C++ 'škola daň priznanie' tokenized (Slovak): " << cxx_result << std::endl;
 
     EXPECT_EQ(cxx_result, "skol dan priznani");
     EXPECT_EQ(cxx_result, python_result);
@@ -429,6 +430,43 @@ TEST_F(RAGAnalyzerTest, test_switching_from_a_stem_and_fold_language) {
     analyzer_->SetLanguage("chinese");
     EXPECT_EQ(analyzer_->Tokenize("running skoly"), "run skoli");
     EXPECT_EQ(analyzer_->Tokenize("škola"), "š kola");
+}
+
+TEST_F(RAGAnalyzerTest, test_slovak_lemma_table) {
+    if (!analyzer_) {
+        FAIL() << "RAGAnalyzer not loaded, skipping test";
+    }
+    if (!fs::exists(fs::path("/usr/share/infinity/resource") / SlovakLemmatizer::TABLE_PATH)) {
+        GTEST_SKIP() << "No Slovak lemma table in the resource directory";
+    }
+    // The table reaches the forms whose stem the suffix rules cannot recover:
+    // on its own the stemmer leaves "psovi" and "ľuďmi" apart from "pes" and
+    // "ľudia".
+    const std::string input = "psovi pes ľudí ľuďmi ľudia Ľudí PSOVI daňové daňového daňový nebezpečný bezpečný psa nič tomu";
+    std::string python_cmd = "uv run " + rag_tokenizer_path_ + "/rag_tokenizer.py " + "-l slovak \"" + input + "\"";
+    FILE *pipe = popen(python_cmd.c_str(), "r");
+    std::string python_result;
+    char buffer[128];
+    if (pipe) {
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            python_result += buffer;
+        }
+        pclose(pipe);
+    }
+    python_result.erase(python_result.find_last_not_of(" \n\r\t") + 1);
+
+    analyzer_->SetLanguage("slovak");
+    std::string cxx_result = analyzer_->Tokenize(input);
+    // Every form of an adjective meets at its lemma's stem, negation stays a
+    // term of its own, and the forms the table leaves out -- shorter than four
+    // letters, or only known to hunspell-sk as an unrelated word -- keep their
+    // stem.
+    EXPECT_EQ(cxx_result, "pes pes ludi ludi ludi ludi pes danov danov danov nebezpecn bezpecn psa nic tomu");
+    EXPECT_EQ(cxx_result, python_result);
+
+    // Czech has no table.
+    analyzer_->SetLanguage("czech");
+    EXPECT_EQ(analyzer_->Tokenize("psovi pes"), "psov pes");
 }
 
 TEST_F(RAGAnalyzerTest, test_czech_light_stemming) {
@@ -624,10 +662,10 @@ TEST_F(RAGAnalyzerTest, test_slovak_tokenize_with_position) {
         FAIL() << "RAGAnalyzer not loaded, skipping test";
     }
     // Stemming and folding both shorten the emitted term; positions must
-    // still refer to byte offsets in the original input ("š" and "ň"/"é" are
-    // 2 bytes each).
+    // still refer to byte offsets in the original input ("š" and "ň" are 2
+    // bytes each).
     analyzer_->SetLanguage("slovak");
-    auto [tokens, positions] = analyzer_->TokenizeWithPosition("škola daňové");
+    auto [tokens, positions] = analyzer_->TokenizeWithPosition("škola daňou");
     ASSERT_EQ(tokens.size(), 2u);
     EXPECT_EQ(tokens[0], "skol");
     EXPECT_EQ(tokens[1], "dan");
@@ -635,9 +673,9 @@ TEST_F(RAGAnalyzerTest, test_slovak_tokenize_with_position) {
     EXPECT_EQ(positions[0].first, 0u);
     // "škola" spans bytes [0, 6) of the original input.
     EXPECT_EQ(positions[0].second, 6u);
-    // "daňové" spans bytes [7, 15) of the original input.
+    // "daňou" spans bytes [7, 13) of the original input.
     EXPECT_EQ(positions[1].first, 7u);
-    EXPECT_EQ(positions[1].second, 15u);
+    EXPECT_EQ(positions[1].second, 13u);
 }
 
 TEST_F(RAGAnalyzerTest, test_chinese_stopword_filter) {

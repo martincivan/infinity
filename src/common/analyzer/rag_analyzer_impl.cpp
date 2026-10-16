@@ -30,6 +30,7 @@ import :stemmer;
 import :analyzer;
 import :darts_trie;
 import :wordnet_lemmatizer;
+import :slovak_lemmatizer;
 import :stemmer;
 import :term;
 
@@ -670,8 +671,9 @@ RAGAnalyzer::RAGAnalyzer(const std::string &path)
 }
 
 RAGAnalyzer::RAGAnalyzer(const RAGAnalyzer &other)
-    : own_dict_(false), trie_(other.trie_), pos_table_(other.pos_table_), wordnet_lemma_(other.wordnet_lemma_), stemmer_(std::make_unique<Stemmer>()),
-      opencc_(other.opencc_), lowercase_string_buffer_(term_string_buffer_limit_), fine_grained_(other.fine_grained_) {
+    : dict_path_(other.dict_path_), own_dict_(false), trie_(other.trie_), pos_table_(other.pos_table_), wordnet_lemma_(other.wordnet_lemma_),
+      stemmer_(std::make_unique<Stemmer>()), opencc_(other.opencc_), lowercase_string_buffer_(term_string_buffer_limit_),
+      fine_grained_(other.fine_grained_) {
     InitStemmer(STEM_LANG_ENGLISH);
 }
 
@@ -710,6 +712,9 @@ void RAGAnalyzer::SetLanguage(const std::string &language) {
     if (stem_and_fold_) {
         latin_stemmer_ = std::make_unique<Stemmer>();
         latin_stemmer_->Init(lang_key == "slovak" ? STEM_LANG_SLOVAK : STEM_LANG_CZECH);
+        // Slovak first looks the token up in a lemma table, which reaches
+        // the forms the suffix rules miss ("ľudí" -> "ľudia").
+        slovak_lemmatizer_ = lang_key == "slovak" ? SlovakLemmatizer::Shared(dict_path_) : nullptr;
         LOG_DEBUG(fmt::format("Tokenizer language set to '{}' (light stemming, then diacritics folding)", language));
         return;
     }
@@ -1530,7 +1535,7 @@ void RAGAnalyzer::MergeWithPosition(const std::vector<std::string> &tokens,
     merged_positions = std::move(res_positions);
 }
 
-// Lemmatize (English only) and stem one already-lowercased term; a
+// Lemmatize (English, Slovak) and stem one already-lowercased term; a
 // stem-and-fold language stems the accented term and folds the stem to ASCII
 // afterwards, so that 'škôl' and 'školy' meet at 'skol'. Mirrors
 // _normalize_token() in rag_tokenizer.py.
@@ -1538,7 +1543,8 @@ std::string RAGAnalyzer::NormalizeTerm(const std::string &lowercase_term) {
     if (stem_and_fold_) {
         std::string stem_term = lowercase_term;
         if (re2::RE2::FullMatch(lowercase_term, latin_word_pattern_)) {
-            latin_stemmer_->Stem(lowercase_term, stem_term);
+            std::string lemma = slovak_lemmatizer_ ? std::string(slovak_lemmatizer_->Lemmatize(lowercase_term)) : lowercase_term;
+            latin_stemmer_->Stem(lemma, stem_term);
         }
         return FoldDiacritics(stem_term);
     }
