@@ -21,7 +21,8 @@
 #     "readerwriterlock>=1.0.0,<2.0.0",
 #     "datrie>=0.8.3,<0.9.0",
 #     "hanziconv>=0.3.0,<0.4.0",
-#     "nltk>=3.9.0,<4.0.0"
+#     "nltk>=3.9.0,<4.0.0",
+#     "snowballstemmer>=3.1.0,<4.0.0"
 # ]
 # ///
 
@@ -40,6 +41,7 @@ import string
 import unicodedata
 
 import datrie
+import snowballstemmer
 from hanziconv import HanziConv
 from nltk import word_tokenize
 from nltk.stem import SnowballStemmer, WordNetLemmatizer
@@ -66,11 +68,170 @@ _SNOWBALL_LANGUAGE_MAP = {
     "turkish": "turkish",
 }
 
-# Languages tokenized with diacritics folded to ASCII and no stemming.
-# SPLIT_CHAR only keeps ASCII letter runs whole, so accented words would
-# otherwise be fragmented before indexing ('škola' -> 'š kola'), and
-# neither language has a Snowball stemmer.
-_DIACRITIC_FOLDING_LANGUAGES = {"slovak", "czech"}
+# Languages whose tokens are stemmed while they still carry their
+# diacritics and are folded to ASCII only afterwards (see _normalize_token).
+# Folding is what makes accent-insensitive search work; it has to come last
+# because both stemmers match suffixes written with accented letters.
+_STEM_AND_FOLD_LANGUAGES = {"slovak", "czech"}
+
+# Letters a stem-and-fold language may build a word from: ASCII plus the
+# Latin-1 Supplement and Latin Extended-A block that _fold_char covers.
+_LATIN_WORD_PATTERN = re.compile(r"[a-zA-Z_\u00C0-\u017F-]+$")
+
+
+def _build_latin_lower_table() -> dict:
+    # U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE is the only letter in the
+    # range whose str.lower() is two characters ("i" + U+0307); map it to a
+    # plain "i" so the table stays one-to-one and the C++ RAGAnalyzer can
+    # mirror it exactly.
+    table = {}
+    for codepoint in range(0xC0, 0x180):
+        lowered = chr(codepoint).lower()
+        table[codepoint] = lowered if len(lowered) == 1 else "i"
+    return table
+
+
+_LATIN_LOWER_TABLE = _build_latin_lower_table()
+
+
+def lower_latin(text: str) -> str:
+    """Lowercase Latin-1 Supplement and Latin Extended-A letters: 'Škola' -> 'škola'."""
+    if text.isascii():
+        return text
+    return text.translate(_LATIN_LOWER_TABLE)
+
+
+class _SlovakStemmer:
+    """Light stemmer for Slovak.
+
+    Ported from the Slovak stemmer in wikimedia/search-extra
+    (opensearch-extra-analysis-slovak), licensed by the Wikimedia Foundation
+    under the Apache License, Version 2.0. That implementation follows the
+    structure of the Apache Lucene "Light Stemmer for Czech"
+    (org.apache.lucene.analysis.cz.CzechStemmer, Apache License 2.0), which
+    implements Dolamic and Savoy, "Indexing and stemming approaches for the
+    Czech language" (Information Processing & Management 45(6), 2009).
+
+    The Slovak suffix inventory is adapted from stemm-sk, Copyright (c) 2015
+    Marek Suppa, licensed under the MIT License:
+
+      Permission is hereby granted, free of charge, to any person obtaining
+      a copy of this software and associated documentation files (the
+      "Software"), to deal in the Software without restriction, including
+      without limitation the rights to use, copy, modify, merge, publish,
+      distribute, sublicense, and/or sell copies of the Software, and to
+      permit persons to whom the Software is furnished to do so, subject to
+      the following conditions:
+
+      The above copyright notice and this permission notice shall be
+      included in all copies or substantial portions of the Software.
+
+    Input is expected to be lowercase and to still carry its diacritics.
+    """
+
+    @staticmethod
+    def _ends_with(chars: list, length: int, suffix: str) -> bool:
+        return length >= len(suffix) and chars[length - len(suffix): length] == list(suffix)
+
+    @classmethod
+    def _palatalise(cls, chars: list, length: int) -> int:
+        ends_with = cls._ends_with
+        if any(ends_with(chars, length, s) for s in ("ci", "ce", "či", "če")):
+            chars[length - 2] = "k"  # [cč][ie] -> k
+        elif any(ends_with(chars, length, s) for s in ("zi", "ze", "ži", "že")):
+            chars[length - 2] = "h"  # [zž][ie] -> h
+        elif any(ends_with(chars, length, s) for s in ("čte", "čti", "čtí")):
+            chars[length - 3] = "c"  # čt[eií] -> ck
+            chars[length - 2] = "k"
+        elif any(ends_with(chars, length, s) for s in ("šte", "šti", "ští")):
+            chars[length - 3] = "s"  # št[eií] -> sk
+            chars[length - 2] = "k"
+        return length - 1
+
+    @classmethod
+    def _remove_case(cls, chars: list, length: int) -> int:
+        ends_with = cls._ends_with
+        if length > 7 and ends_with(chars, length, "atoch"):
+            return length - 5
+        if length > 6 and ends_with(chars, length, "aťom"):
+            return cls._palatalise(chars, length - 3)
+        if length > 5:
+            if any(
+                ends_with(chars, length, s)
+                for s in ("och", "ich", "ích", "ého", "ami", "emi", "ému", "ete", "eti", "iho", "ího", "ími", "imu", "aťa")
+            ):
+                return cls._palatalise(chars, length - 2)
+            if any(ends_with(chars, length, s) for s in ("ách", "ata", "aty", "ých", "ové", "ovi", "ými")):
+                return length - 3
+        if length > 4:
+            if ends_with(chars, length, "om"):
+                return cls._palatalise(chars, length - 1)
+            if any(ends_with(chars, length, s) for s in ("es", "ém", "ím")):
+                return cls._palatalise(chars, length - 2)
+            if any(ends_with(chars, length, s) for s in ("úm", "at", "ám", "os", "us", "ým", "mi", "ou", "ej")):
+                return length - 2
+        if length > 3:
+            if chars[length - 1] in ("e", "i", "í"):
+                return cls._palatalise(chars, length)
+            if chars[length - 1] in ("ú", "y", "a", "o", "á", "é", "ý"):
+                return length - 1
+        return length
+
+    @classmethod
+    def _remove_possessives(cls, chars: list, length: int) -> int:
+        if length > 5:
+            if cls._ends_with(chars, length, "ov"):
+                return length - 2
+            if cls._ends_with(chars, length, "in"):
+                return cls._palatalise(chars, length - 1)
+        return length
+
+    @staticmethod
+    def _remove_prefixes(chars: list, length: int) -> int:
+        if length > 5 and chars[0:3] == ["n", "a", "j"]:
+            del chars[0:3]
+            return length - 3
+        return length
+
+    def stemWord(self, word: str) -> str:  # mirrors the snowballstemmer API
+        chars = list(word)
+        length = self._remove_case(chars, len(chars))
+        length = self._remove_possessives(chars, length)
+        length = self._remove_prefixes(chars, length)
+        return "".join(chars[:length])
+
+
+class _SlovakLemmatizer:
+    """Dictionary forms of inflected Slovak words.
+
+    Covers the forms the light stemmer cannot reduce on its own ("ľudí" ->
+    "ľudia", "psovi" -> "pes"). The table is resource/slovak/lemma.tsv: one
+    "form<TAB>lemma" line per lowercase form.
+    tools/generate_slovak_lemma_table.py derives it from the hunspell-sk
+    dictionary, and it carries that dictionary's licence (MPL-2.0) next to it.
+    Mirrors SlovakLemmatizer in the C++ RAGAnalyzer.
+    """
+
+    TABLE_PATH = "/usr/share/infinity/resource/slovak/lemma.tsv"
+    _shared = {}
+
+    @classmethod
+    def shared(cls, path: str = TABLE_PATH):
+        """The table at path, read once per process; None when it is missing."""
+        if path not in cls._shared:
+            if os.path.exists(path):
+                cls._shared[path] = cls(path)
+            else:
+                logging.warning("Slovak lemma table not found, stemming without it: %s", path)
+                cls._shared[path] = None
+        return cls._shared[path]
+
+    def __init__(self, path: str):
+        with open(path, encoding="utf-8") as table:
+            self._lemmas = dict(line.rstrip("\n").split("\t", 1) for line in table if "\t" in line)
+
+    def lemmatize(self, form: str) -> str:
+        return self._lemmas.get(form, form)
 
 
 def _fold_char(char: str) -> str:
@@ -95,6 +256,13 @@ def fold_diacritics(text: str) -> str:
 
 
 class RagTokenizer:
+    # The letter run alternative keeps a word whole; everything it does not
+    # cover splits the line. The ASCII form therefore cuts accented words at
+    # the accent ('škola' -> 'š', 'kola'), so a stem-and-fold language uses
+    # the Latin form, which also admits the block _fold_char folds.
+    SPLIT_CHAR_ASCII = r"([ ,\.<>/?;:'\[\]\\`!@#$%^&*\(\)\{\}\|_+=《》，。？、；‘’：“”【】~！￥%……（）——-]+|[a-zA-Z0-9,\.-]+)"
+    SPLIT_CHAR_LATIN = r"([ ,\.<>/?;:'\[\]\\`!@#$%^&*\(\)\{\}\|_+=《》，。？、；‘’：“”【】~！￥%……（）——-]+|[a-zA-Z0-9\u00C0-\u017F,\.-]+)"
+
     def key_(self, line):
         return str(line.lower().encode("utf-8"))[2:-1]
 
@@ -150,9 +318,11 @@ class RagTokenizer:
         self.stemmer = SnowballStemmer("english")
         self.lemmatizer = WordNetLemmatizer()
         self._use_lemmatizer = True  # WordNet only supports English
-        self._fold_diacritics = False
+        self._stem_and_fold = False
+        self._latin_stemmer = None  # Slovak/Czech; see set_language()
+        self._slovak_lemmatizer = None  # see set_language()
 
-        self.SPLIT_CHAR = r"([ ,\.<>/?;:'\[\]\\`!@#$%^&*\(\)\{\}\|_+=《》，。？、；‘’：“”【】~！￥%……（）——-]+|[a-zA-Z0-9,\.-]+)"
+        self.SPLIT_CHAR = self.SPLIT_CHAR_ASCII
 
         trie_file_name = self.DIR_ + ".trie"
         # check if trie file existence
@@ -193,11 +363,21 @@ class RagTokenizer:
         """
         lang_key = language.strip().lower()
 
-        self._fold_diacritics = lang_key in _DIACRITIC_FOLDING_LANGUAGES
-        if self._fold_diacritics:
-            # Folded to ASCII in tokenize() and left unstemmed: there is no
-            # Snowball stemmer for these languages (see _normalize_token).
-            logging.debug("Tokenizer language set to '%s' (diacritics folding, no stemming)", language)
+        self._stem_and_fold = lang_key in _STEM_AND_FOLD_LANGUAGES
+        self.SPLIT_CHAR = self.SPLIT_CHAR_LATIN if self._stem_and_fold else self.SPLIT_CHAR_ASCII
+        if self._stem_and_fold:
+            # Snowball has no Slovak algorithm, so Slovak uses the light
+            # stemmer ported above; Czech uses Snowball's own (added in
+            # Snowball 3.1.0, and absent from nltk). It goes in its own slot:
+            # self.stemmer keeps whichever Snowball stemmer was last selected,
+            # so switching on to a language that has no entry in the map below
+            # -- which leaves the previous stemmer in place by design -- can
+            # never land on a stemmer with a different API.
+            self._latin_stemmer = _SlovakStemmer() if lang_key == "slovak" else snowballstemmer.stemmer(lang_key)
+            # Slovak first looks the token up in a lemma table, which reaches
+            # the forms the suffix rules miss ("ľudí" -> "ľudia").
+            self._slovak_lemmatizer = _SlovakLemmatizer.shared() if lang_key == "slovak" else None
+            logging.debug("Tokenizer language set to '%s' (light stemming, then diacritics folding)", language)
             return
 
         snowball_lang = _SNOWBALL_LANGUAGE_MAP.get(lang_key)
@@ -426,11 +606,19 @@ class RagTokenizer:
 
         When the lemmatizer is enabled (English), applies lemmatization
         before stemming.  For other Snowball-supported languages, only
-        stemming is applied.  Non-alphabetic tokens are returned as-is,
-        and so is every token of a diacritic-folding language.
+        stemming is applied.  Non-alphabetic tokens are returned as-is.
+
+        A stem-and-fold language stems the accented token and folds the stem
+        afterwards, so that 'škôl' and 'školy' meet at 'skol'; folding first
+        would strip the accents the suffix rules match on. Slovak first replaces
+        the token with its lemma when the lemma table has one.
         """
-        if self._fold_diacritics:
-            return t
+        if self._stem_and_fold:
+            if _LATIN_WORD_PATTERN.match(t):
+                if self._slovak_lemmatizer:
+                    t = self._slovak_lemmatizer.lemmatize(t)
+                t = self._latin_stemmer.stemWord(t)
+            return fold_diacritics(t)
         if re.match(r"[a-zA-Z_-]+$", t):
             if self._use_lemmatizer:
                 return self.stemmer.stem(self.lemmatizer.lemmatize(t))
@@ -461,8 +649,11 @@ class RagTokenizer:
         return txt_lang_pairs
 
     def tokenize(self, line: str) -> str:
-        if self._fold_diacritics:
-            line = fold_diacritics(line)
+        if self._stem_and_fold:
+            # The per-token lowercase below is ASCII-only in the C++
+            # RAGAnalyzer, so lowercase the accented letters here, where both
+            # implementations can do it the same way.
+            line = lower_latin(line)
         line = re.sub(r"\W+", " ", line)
         line = self._strQ2B(line).lower()
         line = self._tradi2simp(line)

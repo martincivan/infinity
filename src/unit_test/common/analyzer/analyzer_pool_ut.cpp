@@ -112,30 +112,31 @@ TEST_F(AnalyzerPoolTest, test_rag_fine_keeps_english_stemming) {
     EXPECT_EQ(AnalyzeToTokens(*analyzer, GRAIN_PROBE), (std::vector<std::string>{"中华", "人民共和国"}));
 }
 
-TEST_F(AnalyzerPoolTest, test_rag_slovak_folds_and_disables_stemming) {
+TEST_F(AnalyzerPoolTest, test_rag_slovak_stems_and_folds) {
     if (!resource_available_) {
         FAIL() << "Resource directory /usr/share/infinity/resource not available; the analyzer cannot be loaded";
     }
     auto analyzer = GetRAGAnalyzer("rag-slovak");
     ASSERT_NE(analyzer, nullptr);
 
-    EXPECT_EQ(analyzer->Tokenize("škola"), "skola");
-    EXPECT_EQ(analyzer->Tokenize("daňové priznanie"), "danove priznanie");
-    // No stemming for Slovak.
+    EXPECT_EQ(analyzer->Tokenize("škola"), "skol");
+    EXPECT_EQ(analyzer->Tokenize("daň priznanie"), "dan priznani");
+    // The Slovak rules leave an English word alone; English lemmatization and
+    // Snowball stemming are off.
     EXPECT_EQ(analyzer->Tokenize("running"), "running");
     // Still coarse without a "fine" segment.
     EXPECT_EQ(AnalyzeToTokens(*analyzer, GRAIN_PROBE), (std::vector<std::string>{"中华人民共和国"}));
 }
 
-TEST_F(AnalyzerPoolTest, test_rag_czech_folds_and_disables_stemming) {
+TEST_F(AnalyzerPoolTest, test_rag_czech_stems_and_folds) {
     if (!resource_available_) {
         FAIL() << "Resource directory /usr/share/infinity/resource not available; the analyzer cannot be loaded";
     }
     auto analyzer = GetRAGAnalyzer("rag-czech");
     ASSERT_NE(analyzer, nullptr);
 
-    EXPECT_EQ(analyzer->Tokenize("škola"), "skola");
-    EXPECT_EQ(analyzer->Tokenize("příliš žluťoučký kůň"), "prilis zlutoucky kun");
+    EXPECT_EQ(analyzer->Tokenize("škola"), "skol");
+    EXPECT_EQ(analyzer->Tokenize("příliš žluťoučký kůň"), "prilis zlutouck kun");
     EXPECT_EQ(analyzer->Tokenize("running"), "running");
     EXPECT_EQ(AnalyzeToTokens(*analyzer, GRAIN_PROBE), (std::vector<std::string>{"中华人民共和国"}));
 }
@@ -144,11 +145,11 @@ TEST_F(AnalyzerPoolTest, test_rag_language_and_fine_in_both_orders) {
     if (!resource_available_) {
         FAIL() << "Resource directory /usr/share/infinity/resource not available; the analyzer cannot be loaded";
     }
-    const std::vector<std::string> expected{"skola", "中华", "人民共和国"};
+    const std::vector<std::string> expected{"skol", "中华", "人民共和国"};
     for (const std::string &name : {"rag-czech-fine", "rag-fine-czech", "rag-slovak-fine", "rag-fine-slovak"}) {
         auto analyzer = GetRAGAnalyzer(name);
         ASSERT_NE(analyzer, nullptr) << name;
-        EXPECT_EQ(analyzer->Tokenize("škola"), "skola") << name;
+        EXPECT_EQ(analyzer->Tokenize("škola"), "skol") << name;
         EXPECT_EQ(analyzer->Tokenize("running"), "running") << name;
         EXPECT_EQ(AnalyzeToTokens(*analyzer, std::string("škola ") + GRAIN_PROBE), expected) << name;
     }
@@ -164,7 +165,7 @@ TEST_F(AnalyzerPoolTest, test_rag_unknown_segment_falls_back_to_legacy) {
         auto analyzer = GetRAGAnalyzer(name);
         ASSERT_NE(analyzer, nullptr) << name;
         EXPECT_EQ(analyzer->Tokenize("running"), "run") << name;
-        EXPECT_EQ(analyzer->Tokenize("škola").find("skola"), std::string::npos) << name;
+        EXPECT_EQ(analyzer->Tokenize("škola").find("skol"), std::string::npos) << name;
         EXPECT_EQ(AnalyzeToTokens(*analyzer, GRAIN_PROBE), (std::vector<std::string>{"中华人民共和国"})) << name;
     }
 
@@ -183,13 +184,13 @@ TEST_F(AnalyzerPoolTest, test_rag_analyzers_are_independent) {
     // instance must not leak its settings into the next one handed out.
     auto slovak = GetRAGAnalyzer("rag-slovak");
     ASSERT_NE(slovak, nullptr);
-    EXPECT_EQ(slovak->Tokenize("škola"), "skola");
+    EXPECT_EQ(slovak->Tokenize("škola"), "skol");
 
     auto english = GetRAGAnalyzer("rag");
     ASSERT_NE(english, nullptr);
     EXPECT_EQ(english->Tokenize("running"), "run");
-    EXPECT_EQ(english->Tokenize("škola").find("skola"), std::string::npos);
+    EXPECT_EQ(english->Tokenize("škola").find("skol"), std::string::npos);
 
     // The Slovak instance is unaffected by the later English one.
-    EXPECT_EQ(slovak->Tokenize("daňové"), "danove");
+    EXPECT_EQ(slovak->Tokenize("daň"), "dan");
 }
